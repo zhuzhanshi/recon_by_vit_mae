@@ -1,0 +1,12 @@
+numpy
+scipy
+opencv-python
+scikit-image
+scikit-learn
+matplotlib
+pyyaml
+tqdm
+torch
+torchvision
+pillow
+tensorboard>=2.12

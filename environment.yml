@@ -1,0 +1,21 @@
+name: te_project
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - numpy
+  - scipy
+  - opencv
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - tqdm
+  - pip
+  - pip:
+      - pillow
+      - tensorboard>=2.12

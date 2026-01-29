@@ -1,0 +1,7 @@
+mae_pretrain_vit_base.pth
+outputs/
+synthetic_root/
+AGENTS.md
+__pycache__
+.pytest_cache
+runs/

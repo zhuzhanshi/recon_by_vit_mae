@@ -1,0 +1,56 @@
+# Config-first experiment settings for Spec v2 pipeline.
+
+model:
+  patch_size: 16  # ViT/MAE patch size; larger = faster, lower spatial detail.
+  encoder_preset: tiny  # tiny|vitb; vitb required when init_from_pretrained=true.
+
+train:
+  epochs: 10        # Train epochs; more = better recon, slower.
+  batch_size: 8     # Batch size; larger = faster, higher memory.
+  lr: 1.0e-4        # AdamW learning rate; higher = faster but less stable.
+  weight_decay: 0.05  # Regularization; higher reduces overfit, may underfit.
+  num_workers: 0    # DataLoader workers; higher = faster I/O, more CPU.
+  seed: 123         # RNG seed; change for different crop sampling.
+  log_dir: runs     # TensorBoard base dir; use: tensorboard --logdir runs.
+  output_dir: outputs  # Base output dir for checkpoints/visuals.
+  exp_name: mae_pretrain  # Base experiment name; timestamp suffix can be auto-appended.
+  exp_name_time_suffix: true  # If true, resolved exp_name becomes "<exp_name>_<timestamp>".
+  exp_name_time_format: "%Y%m%d_%H%M%S"  # Timestamp format for suffix.
+  eval_interval: 1  # Evaluate every N epochs; higher = faster.
+  viz_interval: 1   # Save recon visuals every N epochs; higher = faster.
+  viz_samples: 4    # Number of val samples to visualize each time.
+  save_interval: 1  # Save last.pth every N epochs.
+  save_best: true   # Save best.pth by lowest val loss.
+
+mae:
+  mask_ratio_pretrain: 0.75  # Mask ratio for pretrain; higher = harder task.
+  mask_ratio_finetune: 0.15  # Mask ratio for finetune; non-zero per spec.
+  init_from_pretrained: false  # Enable loading encoder weights from pretrained ckpt.
+  pretrained_ckpt: mae_pretrain_vit_base.pth  # Path to pretrained ViT-B/16 (MAE) checkpoint.
+  load_encoder_only: true  # Load only encoder (decoder stays random).
+  pos_embed_strategy: interpolate  # interpolate/skip when pos_embed size mismatches.
+  patch_embed_strategy: strict  # strict/adapt_in_chans when patch_embed shape differs.
+
+finetune:
+  freeze_encoder: true  # Keep encoder frozen; only decoder updates.
+
+infer:
+  crop_size: 512   # Sliding window size; must match training crop.
+  stride: 256      # Window stride; smaller = smoother but slower.
+  device: auto     # auto/cpu/cuda; auto uses CUDA if available.
+
+postprocess:
+  residual_mode: gray  # Heatmap source; gray uses |gray - recon|.
+  quantile: 0.995      # Threshold quantile; higher = fewer detections.
+  quantile_candidates: [0.95, 0.99, 0.995]  # Val residual stats to guide quantile choice.
+  log_residual_quantiles: true  # Log residual quantiles during val for tuning.
+  min_area: 200        # Min CC area; higher reduces noise.
+  morph_radius: 2      # Morphology radius; higher smooths but may merge.
+
+data:
+  roots_txt: null       # Optional default roots.txt for train-only runs.
+  train_roots_txt: null # Train roots.txt; overrides roots_txt when set.
+  val_roots_txt: null   # Val roots.txt; enables validation if set.
+  test_roots_txt: null  # Test roots.txt; for evaluation/infer-only.
+  vehicle_allowlist: null  # List[int] to filter vehicles; null = all.
+  camera_allowlist: null   # List[int] to filter cameras; null = all.
