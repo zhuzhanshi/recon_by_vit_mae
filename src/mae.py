@@ -286,3 +286,52 @@ class MAE(nn.Module):
         loss = (pred - target).abs().mean(dim=-1)
         loss = (loss * mask).sum() / mask.sum().clamp(min=1.0)
         return loss
+
+    def encode_tokens(self, x: torch.Tensor) -> torch.Tensor:
+        # Return patch tokens (no cls) after encoder, no masking.
+        b, c, h, w = x.shape
+        if isinstance(self.patch_embed, PatchEmbedConv):
+            tokens = self.patch_embed(x)
+        else:
+            tokens = self.patch_embed(x, self.grid_h, self.grid_w)
+
+        if self.include_cls_token:
+            cls = self.cls_token.expand(b, -1, -1)
+            cls = cls + self.pos_embed[:, :1, :].to(tokens.device)
+            tokens = tokens + self.pos_embed[:, 1:, :].to(tokens.device)
+            tokens = torch.cat([cls, tokens], dim=1)
+        else:
+            tokens = tokens + self.pos_embed.to(tokens.device)
+
+        if self.use_vit_blocks:
+            enc = tokens
+            for blk in self.blocks:
+                enc = blk(enc)
+            enc = self.norm(enc)
+        else:
+            enc = self.encoder(tokens)
+
+        if self.include_cls_token:
+            enc = enc[:, 1:, :]
+        return enc
+
+
+class CNNDecoder(nn.Module):
+    def __init__(self, in_chans: int, target_size: int, grid_size: int, out_chans: int = 1):
+        super().__init__()
+        self.target_size = target_size
+        self.grid_size = grid_size
+        # Prefer stable, smooth recon over high-frequency detail.
+        self.conv1 = nn.Conv2d(in_chans, 64, 3, padding=1)
+        self.conv2 = nn.Conv2d(64, 32, 3, padding=1)
+        self.out = nn.Conv2d(32, out_chans, 1)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # One upsample + small conv stack for stable anomaly residuals.
+        x = torch.nn.functional.interpolate(
+            x, size=(self.target_size, self.target_size), mode="bilinear", align_corners=False
+        )
+        x = self.act(self.conv1(x))
+        x = self.act(self.conv2(x))
+        return self.out(x)

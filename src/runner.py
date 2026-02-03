@@ -13,6 +13,7 @@ from .indexer import build_index, read_roots_txt
 from .infer_block import infer_block
 from .mae import MAE, unpatchify_gray
 from .model_stub import StubMAE
+from .parsing import parse_filename
 from .postprocess import heatmap_to_bboxes
 from .stitch import stitch_blocks
 from .viz import save_overlay_bboxes, save_overlay_heatmap
@@ -69,6 +70,46 @@ def _build_model(args, cfg: ConfigView) -> torch.nn.Module:
             mask_ratio=0.0,
         ).to(device)
         ckpt = torch.load(args.ckpt, map_location="cpu")
+        decoder_type = cfg.get("finetune.decoder_type", "mae")
+        if ckpt.get("decoder_type") == "cnn" or decoder_type == "cnn":
+            class _CNNDecoder(torch.nn.Module):
+                def __init__(self, in_chans: int, out_chans: int = 1):
+                    super().__init__()
+                    self.conv1 = torch.nn.Conv2d(in_chans, 64, 3, padding=1)
+                    self.conv2 = torch.nn.Conv2d(64, 32, 3, padding=1)
+                    self.out = torch.nn.Conv2d(32, out_chans, 3, padding=1)
+                    self.act = torch.nn.ReLU(inplace=True)
+
+                def forward(self, x: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+                    x = torch.nn.functional.interpolate(
+                        x, size=target_hw, mode="bilinear", align_corners=False
+                    )
+                    x = self.act(self.conv1(x))
+                    x = self.act(self.conv2(x))
+                    return self.out(x)
+
+            mae.load_state_dict(ckpt.get("encoder", ckpt.get("model", {})), strict=False)
+            mae.cnn_decoder = _CNNDecoder(mae.embed_dim).to(device)
+            mae.cnn_decoder.load_state_dict(ckpt.get("cnn_decoder", {}), strict=False)
+            mae.eval()
+
+            class _CnnRecon(torch.nn.Module):
+                def __init__(self, model: MAE):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    feat = self.model.encode_tokens(x)
+                    b, n, c = feat.shape
+                    h = int(self.model.grid_h)
+                    w = int(self.model.grid_w)
+                    feat_map = feat.reshape(b, h, w, c).permute(0, 3, 1, 2)
+                    target_hw = (self.model.img_size, self.model.img_size)
+                    recon = self.model.cnn_decoder(feat_map, target_hw)
+                    return recon.clamp(0.0, 1.0)
+
+            return _CnnRecon(mae).to(device)
+
         mae.load_state_dict(ckpt["model"], strict=True)
         mae.eval()
 
@@ -283,6 +324,61 @@ def cmd_infer(args):
         print(f"Saved outputs to {out_dir}")
 
 
+def cmd_infer_single(args):
+    cfg = _load_config(args.config)
+    if getattr(args, "residual_mode", None):
+        cfg.cfg.setdefault("postprocess", {})["residual_mode"] = args.residual_mode
+
+    image_path = args.image
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(image_path)
+
+    vehicle_id, camera_id, series = parse_filename(os.path.basename(image_path))
+
+    with Image.open(image_path) as im:
+        im = im.convert("L")
+        gray = np.array(im, dtype=np.float32) / 255.0
+    h_block, w_block = gray.shape
+
+    if args.roots_txt:
+        roots = read_roots_txt(args.roots_txt)
+        entries, stats = build_index(roots, *_allowlists(cfg))
+        group_key = None
+        for k in stats.keys():
+            if k[1] == vehicle_id and k[2] == camera_id:
+                group_key = k
+                break
+        if group_key is None:
+            raise ValueError("Group not found in roots.txt for this image")
+        group_stats = stats[group_key]
+        w_total = group_stats.w_total
+    else:
+        w_total = w_block * series
+
+    model = _build_model(args, cfg)
+    device = _model_device(model)
+
+    block_map = infer_block(
+        model,
+        gray,
+        series=series,
+        stats={
+            "w_total": w_total,
+            "h_block": h_block,
+            "w_block": w_block,
+        },
+        crop_size=cfg.get("infer.crop_size", 512),
+        stride=cfg.get("infer.stride", 256),
+        residual_mode=cfg.get("postprocess.residual_mode", "gray"),
+        device=str(device),
+    )
+
+    os.makedirs(args.output, exist_ok=True)
+    np.save(os.path.join(args.output, "H_block_map.npy"), block_map)
+    save_overlay_heatmap(block_map, os.path.join(args.output, "overlay_heatmap.jpg"))
+    print(f"Saved outputs to {args.output}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Unified line-scan pipeline")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -325,6 +421,16 @@ def build_parser():
     p_inf.add_argument("--mode", choices=["stub", "mae"], default="stub")
     p_inf.add_argument("--ckpt", default="outputs/mae_finetuned.pth")
     p_inf.set_defaults(func=cmd_infer)
+
+    p_single = sub.add_parser("infer-single", help="Run inference for a single block image")
+    p_single.add_argument("--image", required=True)
+    p_single.add_argument("--roots-txt", dest="roots_txt", default=None)
+    p_single.add_argument("--config", default="configs/default.yaml")
+    p_single.add_argument("--output", default="outputs/single")
+    p_single.add_argument("--residual-mode", default=None)
+    p_single.add_argument("--mode", choices=["stub", "mae"], default="stub")
+    p_single.add_argument("--ckpt", default="outputs/mae_finetuned.pth")
+    p_single.set_defaults(func=cmd_infer_single)
 
     return p
 

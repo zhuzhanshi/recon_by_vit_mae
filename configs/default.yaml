@@ -14,7 +14,7 @@ train:
   log_dir: runs     # TensorBoard base dir; use: tensorboard --logdir runs.
   output_dir: outputs  # Base output dir for checkpoints/visuals.
   exp_name: mae_pretrain  # Base experiment name; timestamp suffix can be auto-appended.
-  exp_name_time_suffix: true  # If true, resolved exp_name becomes "<exp_name>_<timestamp>".
+  exp_name_time_suffix: false  # If true, resolved exp_name becomes "<exp_name>_<timestamp>".
   exp_name_time_format: "%Y%m%d_%H%M%S"  # Timestamp format for suffix.
   eval_interval: 1  # Evaluate every N epochs; higher = faster.
   viz_interval: 1   # Save recon visuals every N epochs; higher = faster.
@@ -32,7 +32,13 @@ mae:
   patch_embed_strategy: strict  # strict/adapt_in_chans when patch_embed shape differs.
 
 finetune:
-  freeze_encoder: true  # Keep encoder frozen; only decoder updates.
+  decoder_type: cnn  # cnn only; MAE decoder is NOT used in finetune.
+  recon_scale: 0.5  # 0.5 or 0.25; low-res reconstruction for stability.
+  loss_type: structural  # structural = SSIM + low-weight pixel term.
+  pixel_loss_weight: 0.3  # Weight for L1 term; SSIM weight is (1 - alpha).
+  ssim_weight: 0.7  # Must be 1 - pixel_loss_weight.
+  loss_ssim_window: 7  # SSIM window size (odd); larger = smoother match.
+  freeze_encoder: true  # Encoder frozen; only CNN decoder updates.
 
 infer:
   crop_size: 512   # Sliding window size; must match training crop.

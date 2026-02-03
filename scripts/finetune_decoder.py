@@ -1,9 +1,9 @@
 import argparse
+import json
 import os
 import sys
 from datetime import datetime
 
-import json
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -18,21 +18,26 @@ if ROOT not in sys.path:
 from scripts.train_mae import MaePretrainDataset, _load_gt
 from src.config import ConfigView, load_config, resolve_split_roots
 from src.indexer import build_index, read_roots_txt
-from src.mae import MAE, unpatchify_gray
+from src.mae import MAE
 
 
-def _freeze_encoder(model: MAE):
-    for p in model.patch_embed.parameters():
-        p.requires_grad = False
-    for p in model.encoder.parameters():
-        p.requires_grad = False
+class CNNDecoder(torch.nn.Module):
+    """Simple, stable decoder: one upsample + small conv stack."""
 
+    def __init__(self, in_chans: int, out_chans: int = 1):
+        super().__init__()
+        self.conv0 = torch.nn.Conv2d(in_chans, 32, 1)
+        # self.conv1 = torch.nn.Conv2d(32, 32, 3, padding=1)
+        # self.conv2 = torch.nn.Conv2d(32, 16, 3, padding=1)
+        self.out = torch.nn.Conv2d(32, out_chans, 3, padding=1)
+        self.act = torch.nn.ReLU(inplace=True)
 
-def _assert_frozen_encoder(model: MAE):
-    for name, p in model.named_parameters():
-        if name.startswith("patch_embed") or name.startswith("encoder"):
-            if p.requires_grad:
-                raise AssertionError(f"Encoder param not frozen: {name}")
+    def forward(self, x: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+        x = self.conv0(x)
+        x = torch.nn.functional.interpolate(x, size=target_hw, mode="bilinear", align_corners=False)
+        # x = self.act(self.conv1(x))
+        # x = self.act(self.conv2(x))
+        return self.out(x)
 
 
 def _resolve_roots(args, cfg: ConfigView) -> tuple[list, list]:
@@ -59,68 +64,67 @@ def _build_loader(entries, stats, gt_groups, cfg: ConfigView, batch_size: int, s
     return loader
 
 
-def _eval_epoch(model: MAE, loader: DataLoader, device: str) -> float:
+def _ssim(x: torch.Tensor, y: torch.Tensor, window_size: int = 7) -> torch.Tensor:
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    pad = window_size // 2
+    filt = torch.ones(1, 1, window_size, window_size, device=x.device) / (window_size * window_size)
+    mu_x = torch.nn.functional.conv2d(x, filt, padding=pad)
+    mu_y = torch.nn.functional.conv2d(y, filt, padding=pad)
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+    sigma_x2 = torch.nn.functional.conv2d(x * x, filt, padding=pad) - mu_x2
+    sigma_y2 = torch.nn.functional.conv2d(y * y, filt, padding=pad) - mu_y2
+    sigma_xy = torch.nn.functional.conv2d(x * y, filt, padding=pad) - mu_xy
+    ssim_map = ((2 * mu_xy + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
+    )
+    return ssim_map.mean()
+
+
+def _recon_loss(recon: torch.Tensor, target: torch.Tensor, alpha: float, ssim_window: int) -> torch.Tensor:
+    pixel = (recon - target).abs().mean()
+    ssim_val = _ssim(recon, target, window_size=ssim_window)
+    return alpha * pixel + (1 - alpha) * (1 - ssim_val)
+
+
+def _eval_epoch(model: MAE, decoder: CNNDecoder, loader: DataLoader, device: str, target_hw) -> float:
     model.eval()
+    decoder.eval()
     total = 0.0
     count = 0
     with torch.no_grad():
         for x in loader:
             x = x.to(device)
-            pred, mask = model(x)
-            loss = model.forward_loss(x, pred, mask)
+            feat = model.encode_tokens(x)
+            b, n, c = feat.shape
+            h = int(model.grid_h)
+            w = int(model.grid_w)
+            feat_map = feat.reshape(b, h, w, c).permute(0, 3, 1, 2)
+            recon = decoder(feat_map, target_hw)
+            gt = torch.nn.functional.interpolate(x[:, 0:1], size=target_hw, mode="bilinear", align_corners=False)
+            loss = _recon_loss(recon, gt, model.loss_alpha, model.loss_ssim_window)
             total += loss.item()
             count += 1
     return total / max(count, 1)
 
 
-def _residual_quantiles(
-    model: MAE,
-    loader: DataLoader,
-    device: str,
-    quantiles: list[float],
-    residual_mode: str,
-    max_pixels_per_batch: int = 200000,
-) -> dict[str, float]:
-    # For efficiency, subsample residual pixels per batch when large.
-    if residual_mode != "gray":
-        raise ValueError(f"Unsupported residual_mode for logging: {residual_mode}")
-
-    model.eval()
-    samples = []
-    with torch.no_grad():
-        for x in loader:
-            x = x.to(device)
-            pred, _ = model(x)
-            recon = unpatchify_gray(pred, model.patch_size, model.img_size, model.img_size)
-            resid = (x[:, 0:1] - recon).abs().flatten()
-            if resid.numel() > max_pixels_per_batch:
-                idx = torch.randperm(resid.numel(), device=resid.device)[:max_pixels_per_batch]
-                resid = resid[idx]
-            samples.append(resid.cpu().numpy())
-
-    if not samples:
-        return {}
-    values = np.concatenate(samples, axis=0)
-    return {f"residual_q{int(q * 1000)}": float(np.quantile(values, q)) for q in quantiles}
-
-
-def _save_viz(
-    model: MAE,
-    loader: DataLoader,
-    device: str,
-    out_dir: str,
-    epoch: int,
-    viz_samples: int,
-    writer: SummaryWriter,
-):
+def _save_viz(model: MAE, decoder: CNNDecoder, loader: DataLoader, device: str, out_dir: str, epoch: int, viz_samples: int, writer: SummaryWriter, target_hw):
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
+    decoder.eval()
     samples = []
     with torch.no_grad():
         for x in loader:
             x = x.to(device)
-            pred, _ = model(x)
-            recon = unpatchify_gray(pred, model.patch_size, model.img_size, model.img_size)
+            feat = model.encode_tokens(x)
+            b, n, c = feat.shape
+            h = int(model.grid_h)
+            w = int(model.grid_w)
+            feat_map = feat.reshape(b, h, w, c).permute(0, 3, 1, 2)
+            recon_low = decoder(feat_map, target_hw)
+            recon = torch.nn.functional.interpolate(recon_low, size=x.shape[-2:], mode="bilinear", align_corners=False)
             gray = x[:, 0:1]
             resid = (gray - recon).abs()
             for i in range(x.shape[0]):
@@ -145,15 +149,13 @@ def _save_viz(
 
 def train(args):
     cfg = ConfigView(load_config(args.config))
-    vehicle_allowlist = args.vehicle_allowlist
-    camera_allowlist = args.camera_allowlist
-    if vehicle_allowlist is None:
-        vehicle_allowlist = cfg.get("data.vehicle_allowlist", None)
-    if camera_allowlist is None:
-        camera_allowlist = cfg.get("data.camera_allowlist", None)
 
     train_roots, val_roots = _resolve_roots(args, cfg)
-    entries, stats = build_index(train_roots, vehicle_allowlist, camera_allowlist)
+    entries, stats = build_index(
+        train_roots,
+        cfg.get("data.vehicle_allowlist", None),
+        cfg.get("data.camera_allowlist", None),
+    )
     gt_groups = _load_gt(args.roots_txt, args.root)
 
     batch_size = args.batch_size or cfg.get("train.batch_size", 8)
@@ -161,7 +163,11 @@ def train(args):
 
     val_loader = None
     if val_roots:
-        val_entries, val_stats = build_index(val_roots, vehicle_allowlist, camera_allowlist)
+        val_entries, val_stats = build_index(
+            val_roots,
+            cfg.get("data.vehicle_allowlist", None),
+            cfg.get("data.camera_allowlist", None),
+        )
         val_loader = _build_loader(val_entries, val_stats, gt_groups, cfg, batch_size, False)
 
     seed = cfg.get("train.seed", None)
@@ -175,17 +181,34 @@ def train(args):
         preset,
         img_size=cfg.get("infer.crop_size", 512),
         patch_size=cfg.get("model.patch_size", 16),
-        mask_ratio=cfg.get("mae.mask_ratio_finetune", 0.15),
+        mask_ratio=0.0,
     ).to(device)
+
     ckpt = torch.load(args.pretrained, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=True)
+    encoder_state = ckpt.get("model", ckpt)
+    model.load_state_dict(encoder_state, strict=False)
 
     if cfg.get("finetune.freeze_encoder", True):
-        _freeze_encoder(model)
-        _assert_frozen_encoder(model)
+        for p in model.parameters():
+            p.requires_grad = False
+
+    recon_scale = cfg.get("finetune.recon_scale", 0.5)
+    if recon_scale not in (0.5, 0.25):
+        recon_scale = 0.5
+    target_hw = (int(model.img_size * recon_scale), int(model.img_size * recon_scale))
+
+    decoder = CNNDecoder(model.embed_dim).to(device)
+
+    model.loss_alpha = cfg.get("finetune.pixel_loss_weight", 0.3)
+    model.loss_ssim_window = cfg.get("finetune.loss_ssim_window", 7)
+
+    enc_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    dec_trainable = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    print(f"encoder_trainable={enc_trainable}")
+    print(f"decoder_trainable={dec_trainable}")
 
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        decoder.parameters(),
         lr=args.lr or cfg.get("train.lr", 1e-4),
         weight_decay=cfg.get("train.weight_decay", 0.05),
     )
@@ -200,8 +223,8 @@ def train(args):
     exp_dir = os.path.join(output_dir, resolved_exp_name)
     os.makedirs(exp_dir, exist_ok=True)
     with open(os.path.join(exp_dir, "resolved_exp_name.txt"), "w", encoding="utf-8") as f:
-        f.write(f"base_exp_name: {base_exp_name}\\n")
-        f.write(f"resolved_exp_name: {resolved_exp_name}\\n")
+        f.write(f"base_exp_name: {base_exp_name}\n")
+        f.write(f"resolved_exp_name: {resolved_exp_name}\n")
 
     log_dir = cfg.get("train.log_dir", "runs")
     writer = SummaryWriter(log_dir=os.path.join(log_dir, resolved_exp_name))
@@ -212,20 +235,23 @@ def train(args):
     viz_samples = cfg.get("train.viz_samples", 4)
     save_interval = cfg.get("train.save_interval", 1)
     save_best = cfg.get("train.save_best", True)
-    log_residual_q = cfg.get("postprocess.log_residual_quantiles", False)
-    quantiles = cfg.get("postprocess.quantile_candidates", [0.95, 0.99, 0.995])
-    residual_mode = cfg.get("postprocess.residual_mode", "gray")
 
     best_val = None
     for epoch in range(1, epochs + 1):
-        model.train()
+        decoder.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
         total = 0.0
         count = 0
         for x in pbar:
             x = x.to(device)
-            pred, mask = model(x)
-            loss = model.forward_loss(x, pred, mask)
+            feat = model.encode_tokens(x)
+            b, n, c = feat.shape
+            h = int(model.grid_h)
+            w = int(model.grid_w)
+            feat_map = feat.reshape(b, h, w, c).permute(0, 3, 1, 2)
+            recon = decoder(feat_map, target_hw)
+            gt = torch.nn.functional.interpolate(x[:, 0:1], size=target_hw, mode="bilinear", align_corners=False)
+            loss = _recon_loss(recon, gt, model.loss_alpha, model.loss_ssim_window)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -239,44 +265,28 @@ def train(args):
 
         val_loss = None
         if val_loader and epoch % eval_interval == 0:
-            val_loss = _eval_epoch(model, val_loader, device)
+            val_loss = _eval_epoch(model, decoder, val_loader, device, target_hw)
             writer.add_scalar("val/loss", val_loss, epoch)
-            if log_residual_q:
-                q_stats = _residual_quantiles(
-                    model, val_loader, device, quantiles, residual_mode
-                )
-                for key, value in q_stats.items():
-                    writer.add_scalar(f"val/{key}", value, epoch)
-                stats_dir = os.path.join(exp_dir, "val_stats")
-                os.makedirs(stats_dir, exist_ok=True)
-                stats_path = os.path.join(stats_dir, f"epoch_{epoch:04d}_residual_quantiles.json")
-                with open(stats_path, "w", encoding="utf-8") as f:
-                    json.dump({"epoch": epoch, **q_stats}, f, indent=2)
 
         if val_loader and epoch % viz_interval == 0:
             viz_dir = os.path.join(exp_dir, "val_viz")
-            _save_viz(model, val_loader, device, viz_dir, epoch, viz_samples, writer)
+            _save_viz(model, decoder, val_loader, device, viz_dir, epoch, viz_samples, writer, target_hw)
 
         if epoch % save_interval == 0:
-            torch.save({"model": model.state_dict(), "epochs": epoch}, os.path.join(exp_dir, "last.pth"))
+            torch.save({"encoder": model.state_dict(), "cnn_decoder": decoder.state_dict()}, os.path.join(exp_dir, "last.pth"))
 
         if save_best and val_loss is not None:
             if best_val is None or val_loss < best_val:
                 best_val = val_loss
-                torch.save({"model": model.state_dict(), "epochs": epoch}, os.path.join(exp_dir, "best.pth"))
-
-    for name, p in model.named_parameters():
-        if name.startswith("patch_embed") or name.startswith("encoder"):
-            if p.grad is not None and torch.any(p.grad != 0):
-                raise AssertionError(f"Encoder received gradient: {name}")
+                torch.save({"encoder": model.state_dict(), "cnn_decoder": decoder.state_dict()}, os.path.join(exp_dir, "best.pth"))
 
     out_path = os.path.join(output_dir, "mae_finetuned.pth")
-    torch.save({"model": model.state_dict(), "epochs": epochs}, out_path)
+    torch.save({"encoder": model.state_dict(), "cnn_decoder": decoder.state_dict(), "decoder_type": "cnn", "epochs": epochs}, out_path)
     print(f"Saved checkpoint to {out_path}")
 
 
 def main():
-    p = argparse.ArgumentParser(description="Fine-tune MAE decoder only")
+    p = argparse.ArgumentParser(description="Fine-tune CNN decoder only")
     p.add_argument("--root", default="synthetic_root/run_0001")
     p.add_argument("--roots-txt", default=None)
     p.add_argument("--config", default="configs/default.yaml")
@@ -285,8 +295,6 @@ def main():
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--vehicle-allowlist", nargs="+", type=int, default=None)
-    p.add_argument("--camera-allowlist", nargs="+", type=int, default=None)
     args = p.parse_args()
     train(args)
 

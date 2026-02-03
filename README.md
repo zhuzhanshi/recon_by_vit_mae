@@ -80,12 +80,21 @@ Finetune the decoder head on unlabeled normal data (or optionally synthetic norm
 python scripts/finetune_decoder.py --roots-txt synthetic_root/roots.txt --pretrained outputs/pretrain/mae_pretrained.pth --config configs/default.yaml --output outputs/finetune
 ```
 
+Finetune uses a CNN decoder (no MAE decoder, no masking) and reconstructs at low resolution
+for stable anomaly detection. See `finetune.recon_scale` and loss settings in config.
+
 ### Inference & postprocess
 
 Run inference on new data using the finetuned model. Postprocessing settings from the config are applied automatically:
 
 ```
 python -m src.runner infer --roots-txt synthetic_root/roots.txt --mode mae --ckpt outputs/finetune/mae_finetuned.pth --config configs/default.yaml --output outputs/infer_mae
+```
+
+Single-image inference (block only):
+
+```
+python -m src.runner infer-single --image /path/to/1_10X1005.jpg --roots-txt synthetic_root/roots.txt --mode mae --ckpt outputs/finetune/mae_finetuned.pth --output outputs/single
 ```
 
 Inference outputs include:  

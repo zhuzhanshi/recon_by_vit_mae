@@ -523,6 +523,28 @@ def train(args):
         weight_decay=cfg.get("train.weight_decay", 0.05),
     )
 
+    # LR schedule: optional linear warmup (epochs) + cosine decay (step-wise).
+    lr_schedule = cfg.get("train.lr_schedule", "constant")
+    warmup_epochs = int(cfg.get("train.warmup_epochs", 0) or 0)
+    steps_per_epoch = max(len(train_loader), 1)
+    total_steps = max(int((args.epochs or cfg.get("train.epochs", 10)) * steps_per_epoch), 1)
+    warmup_steps = max(int(warmup_epochs * steps_per_epoch), 0)
+
+    def _lr_lambda(step: int) -> float:
+        # step is 0-based
+        if lr_schedule == "constant":
+            return 1.0
+        if lr_schedule != "cosine":
+            raise ValueError(f"Unknown train.lr_schedule: {lr_schedule}")
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        # cosine from 1.0 to 0.0 over remaining steps
+        denom = max(total_steps - warmup_steps, 1)
+        t = float(step - warmup_steps) / float(denom)
+        return 0.5 * (1.0 + np.cos(np.pi * t))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+
     output_dir = args.output or cfg.get("train.output_dir", "outputs")
     base_exp_name = cfg.get("train.exp_name", "mae_pretrain")
     use_suffix = cfg.get("train.exp_name_time_suffix", False)
@@ -564,6 +586,7 @@ def train(args):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
             total += loss.item()
             count += 1
             pbar.set_postfix({"loss": total / max(count, 1)})
